@@ -934,6 +934,9 @@ class AbstractLatentBuildSlave(AbstractBuildSlave):
 
     @defer.inlineCallbacks
     def _soft_disconnect(self, fast=False):
+        # From the docs: 'If [build_wait_timeout] is less than 0 it will never
+        # automatically shutdown.' In that case, disconnect the slave, not shut
+        # it down.
         if self.build_wait_timeout < 0:
             yield AbstractBuildSlave.disconnect(self)
             return
