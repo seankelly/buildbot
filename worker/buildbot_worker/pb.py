@@ -16,22 +16,17 @@
 from __future__ import absolute_import
 from __future__ import print_function
 
-import os.path
-import signal
-
 from twisted.application import internet
 from twisted.application import service
 from twisted.cred import credentials
 from twisted.internet import error
 from twisted.internet import reactor
-from twisted.internet import task
 from twisted.python import log
 from twisted.spread import pb
 
 from buildbot_worker.base import BotBase
-from buildbot_worker.base import WorkerBase
+from buildbot_worker.base import ConnectingWorkerBase
 from buildbot_worker.base import WorkerForBuilderBase
-from buildbot_worker.compat import unicode2bytes
 from buildbot_worker.pbutil import ReconnectingPBClientFactory
 from buildbot_worker.util import HangCheckFactory
 
@@ -161,7 +156,7 @@ class BotFactory(ReconnectingPBClientFactory):
         self.stopTimers()
 
 
-class Worker(WorkerBase, service.MultiService):
+class Worker(ConnectingWorkerBase, service.MultiService):
     Bot = BotPb
 
     def __init__(self, buildmaster_host, port, name, passwd, basedir,
@@ -174,27 +169,15 @@ class Worker(WorkerBase, service.MultiService):
 
         assert usePTY is None, "worker-side usePTY is not supported anymore"
 
-        service.MultiService.__init__(self)
-        WorkerBase.__init__(
-            self, name, basedir, umask=umask, unicode_encoding=unicode_encoding)
-        if keepalive == 0:
-            keepalive = None
+        # Store host and port into a tuple. It will be passed straight to other
+        # methods and not inspected at all.
+        buildmaster = buildmaster_host, port
+        ConnectingWorkerBase.__init__(
+            self, buildmaster, name, passwd, basedir, keepalive, umask,
+            maxdelay, numcpus, unicode_encoding, allow_shutdown, maxRetries)
 
-        name = unicode2bytes(name, self.bot.unicode_encoding)
-        passwd = unicode2bytes(passwd, self.bot.unicode_encoding)
-
-        self.numcpus = numcpus
-        self.shutdown_loop = None
-        self.maxRetries = maxRetries
-
-        if allow_shutdown == 'signal':
-            if not hasattr(signal, 'SIGHUP'):
-                raise ValueError("Can't install signal handler")
-        elif allow_shutdown == 'file':
-            self.shutdown_file = os.path.join(basedir, 'shutdown.stamp')
-            self.shutdown_mtime = 0
-
-        self.allow_shutdown = allow_shutdown
+    def _openConnection(self, buildmaster, name, passwd, keepalive, maxdelay):
+        buildmaster_host, port = buildmaster
         bf = self.bf = BotFactory(buildmaster_host, port, keepalive, maxdelay,
             maxRetries=self.maxRetries, maxRetriesCallback=self.gracefulShutdown)
         bf.startLogin(
@@ -209,63 +192,12 @@ class Worker(WorkerBase, service.MultiService):
         if self.maxRetries is not None:
             self.gracefulShutdown()
 
-    def startService(self):
-        WorkerBase.startService(self)
-
-        if self.allow_shutdown == 'signal':
-            log.msg("Setting up SIGHUP handler to initiate shutdown")
-            signal.signal(signal.SIGHUP, self._handleSIGHUP)
-        elif self.allow_shutdown == 'file':
-            log.msg("Watching {0}'s mtime to initiate shutdown".format(
-                    self.shutdown_file))
-            if os.path.exists(self.shutdown_file):
-                self.shutdown_mtime = os.path.getmtime(self.shutdown_file)
-            self.shutdown_loop = loop = task.LoopingCall(self._checkShutdownFile)
-            loop.start(interval=10)
-
-    def stopService(self):
+    def _closeConnection(self):
         self.bf.continueTrying = 0
         self.bf.stopTrying()
-        if self.shutdown_loop:
-            self.shutdown_loop.stop()
-            self.shutdown_loop = None
-        return service.MultiService.stopService(self)
 
-    def _handleSIGHUP(self, *args):
-        log.msg("Initiating shutdown because we got SIGHUP")
-        return self.gracefulShutdown()
+    def _hasActiveConnection(self):
+        return self.bf.perspective
 
-    def _checkShutdownFile(self):
-        if os.path.exists(self.shutdown_file) and \
-                os.path.getmtime(self.shutdown_file) > self.shutdown_mtime:
-            log.msg("Initiating shutdown because {0} was touched".format(
-                    self.shutdown_file))
-            self.gracefulShutdown()
-
-            # In case the shutdown fails, update our mtime so we don't keep
-            # trying to shutdown over and over again.
-            # We do want to be able to try again later if the master is
-            # restarted, so we'll keep monitoring the mtime.
-            self.shutdown_mtime = os.path.getmtime(self.shutdown_file)
-
-    def gracefulShutdown(self):
-        """Start shutting down"""
-        if not self.bf.perspective:
-            log.msg("No active connection, shutting down NOW")
-            reactor.stop()
-            return
-
-        log.msg(
-            "Telling the master we want to shutdown after any running builds are finished")
-        d = self.bf.perspective.callRemote("shutdown")
-
-        def _shutdownfailed(err):
-            if err.check(AttributeError):
-                log.msg(
-                    "Master does not support worker initiated shutdown.  Upgrade master to 0.8.3 or later to use this feature.")
-            else:
-                log.msg('callRemote("shutdown") failed')
-                log.err(err)
-
-        d.addErrback(_shutdownfailed)
-        return d
+    def _shutdownConnection(self):
+        return self.bf.perspective.callRemote("shutdown")
