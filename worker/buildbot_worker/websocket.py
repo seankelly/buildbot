@@ -16,22 +16,57 @@
 from __future__ import absolute_import
 from __future__ import print_function
 
+import json
+
 from autobahn.twisted.websocket import WebSocketClientFactory
 from autobahn.twisted.websocket import WebSocketClientProtocol
 from twisted.application import service
 from twisted.application.internet import ClientService
+from twisted.application.internet import backoffPolicy
 from twisted.internet import reactor
 from twisted.internet.endpoints import clientFromString
 
+from buildbot_worker.base import BotBase
 from buildbot_worker.base import ConnectingWorkerBase
+from buildbot_worker.compat import unicode2bytes
+
+
+class Protocol(WebSocketClientProtocol):
+
+    def onOpen(self):
+        self.sendJsonMessage(self.factory.getLogin())
+
+    def onMessage(self, payload, _isBinary):
+        pass
+
+    def sendJsonMessage(self, payload, **kwargs):
+        frame = unicode2bytes(json.dumps(payload))
+        self.sendMessage(frame, **kwargs)
 
 
 class BotFactory(WebSocketClientFactory):
 
-    protocol = WebSocketClientProtocol
+    protocol = Protocol
+
+    def __init__(self, worker):
+        WebSocketClientFactory.__init__(self)
+        self.worker = worker
+
+    def startLogin(self, username, password):
+        self._credentials = username, password
+
+    def getLogin(self):
+        login = {
+            'cmd': 'worker',
+            'action': 'login',
+            'username': self._credentials[0],
+            'password': self._credentials[1],
+        }
+        return login
 
 
 class WebSocketWorker(ConnectingWorkerBase, service.MultiService):
+    Bot = BotBase
 
     def __init__(self, buildmaster, name, passwd, basedir, keepalive,
                  buildmaster_path='/', umask=None, maxdelay=300, numcpus=None,
@@ -47,9 +82,11 @@ class WebSocketWorker(ConnectingWorkerBase, service.MultiService):
         buildmaster, buildmaster_path = buildmaster_remote
         endpoint = clientFromString(reactor, buildmaster)
         ws_url = 'ws://%s:%s%s/ws' % (endpoint._host, endpoint._port, buildmaster_path)
-        bf = self.bf = BotFactory()
+        bf = self.bf = BotFactory(self)
+        bf.startLogin(name, passwd)
         bf.setSessionParameters(url=ws_url)
-        self.connection = c = ClientService(endpoint, bf)
+        self.connection = c = ClientService(
+            endpoint, bf, retryPolicy=backoffPolicy(maxDelay=maxdelay))
         c.setServiceParent(self)
 
     def _closeConnection(self):
