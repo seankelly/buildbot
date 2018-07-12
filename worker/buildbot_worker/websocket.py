@@ -33,6 +33,10 @@ from buildbot_worker.compat import unicode2bytes
 
 class Protocol(WebSocketClientProtocol):
 
+    def __init__(self):
+        WebSocketClientProtocol.__init__(self)
+        self.frame_id = 0
+
     def onOpen(self):
         self.sendJsonMessage(self.factory.getLogin())
 
@@ -40,8 +44,18 @@ class Protocol(WebSocketClientProtocol):
         pass
 
     def sendJsonMessage(self, payload, **kwargs):
-        frame = unicode2bytes(json.dumps(payload))
+        payload_copy = {}
+        if '_id' not in kwargs:
+            payload_copy['_id'] = self.nextId()
+        payload_copy.update(payload)
+        frame = unicode2bytes(json.dumps(payload_copy))
         self.sendMessage(frame, **kwargs)
+
+    def nextId(self):
+        self.frame_id += 1
+        if self.frame_id > 10000:
+            self.frame_id = 0
+        return self.frame_id
 
 
 class BotFactory(WebSocketClientFactory):
